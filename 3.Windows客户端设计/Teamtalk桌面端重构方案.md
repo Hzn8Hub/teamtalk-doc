@@ -4,31 +4,66 @@
 
 当一个解决方案中既有.exe可执行文件、又有.dll动态库时，目录结构的设计需要兼顾编译时依赖关系和运行时的查找路径。
 
-### 当前项目架构
+# 现有架构分析
 
-- 3rdparty - 第三方开源库
-- sharesrc - 公共代码，被多个项目引用
-- TTClient - 进程组，包含：
-  - network库（网络基础库）
-  - utility库（工具库）
-  - module库（当前主要是群聊功能）
-  - teamtalk主进程
-- sharelib - 导出库
-- dist - 打包资源
+### 企业级IM系统架构设计考虑因素
 
-存在的问题：
+1. 模块化设计：每个功能应该独立模块，便于单独编译和测试
+2. 低耦合高内聚：减少模块间依赖，避免循环引用
+3. 可扩展性：新功能可以容易地添加而不影响现有功能
+4. 部署灵活性：核心IM功能应该独立，支持按需启动其他服务
 
-- modules、network、utility之间存在循环引用
+对于音视频、云盘、远程控制这些功能，采用插件化架构会更合适。通过抽象接口定义模块边界，利用依赖注入和工厂模式来管理模块生命周期，这样能在不影响主程序稳定性的前提下实现功能扩展。
 
-思考问题：
+### 现有架构分析
 
-1. 当前设计是否合理？
-2. 是否需要改为 include/src 目录结构？
-3. 如何改进以支持未来的扩展（音视频、云盘、远程控制等）？
+```shell
+teamtalk.sln
+├── 3rdparty/                    # 第三方库
+│   ├── httpclient/              # HTTP客户端
+│   ├── libogg/                  # Ogg音频库
+│   ├── libspeex/                # Speex音频编解码
+│   ├── GifSmiley/               # GIF表情库
+│   └── DuiLib/                  # UI界面库
+├── TTClient/                    # 主客户端
+│   ├── Modules.vcxproj         # 业务模块DLL（MFC扩展）
+│   │   ├── 依赖：utility.lib, network.lib, httpclient.lib, DuiLib.lib
+│   │   └── 包含：cxImage图像库、protobuf协议、libsecurity安全库
+│   │   └── 包含：Login/Message/Session/Database等业务模块
+│   ├── Network.vcxproj         # 网络库DLL
+│   │   └── 依赖：ws2_32.lib
+│   │   └── 包含：BaseSocket/EventDispatch/ImPduBase等底层网络
+│   ├── Utility.vcxproj          # 工具库DLL（MFC扩展）
+│   │   ├── 依赖：sqlite3.lib, network.lib, Netapi32.lib
+│   │   └── 包含：jsoncpp/libsecurity/sqlite3/工具函数
+│   └── teamtalk.vcxproj        # 主程序EXE
+│       └── 依赖：utility.lib, network.lib, DuiLib.lib, Modules.lib
+```
+
+### 核心设计亮点
+
+| 方面     | 评价                                                         |
+| :------- | :----------------------------------------------------------- |
+| 模块化   | 业务模块（Modules）、网络（Network）、工具（Utility）分离较好 |
+| 代码复用 | 公共库（sharesrc）被多个项目共享                             |
+| 接口设计 | Modules内部有清晰的接口定义（I*Module.h）和实现分离（*_Impl.h） |
+| MKO模式  | 模块间通过观察者模式解耦                                     |
+
+1. MKO观察者模式：模块间通过事件解耦，降低耦合度
+2. 分层清晰：UI -> modules -> network -> utility
+3. 动态库模块化：modules.dll封装了所有的业务模块
 
 ### 存在的问题
 
-1. 模块间循环依赖
+| 问题                                | 描述                                                         |
+| :---------------------------------- | :----------------------------------------------------------- |
+| Modules.dll 过于庞大                | 包含：图像编解码(cxImage) + 协议(protobuf) + 安全库 + 所有业务模块 |
+| sharesrc 目录混乱                   | cxImage、libsecurity、protocal混在一起，没有明确归属         |
+| utility.dll 与 Modules.dll 重复依赖 | libsecurity (aes/base64/md5) 在两边都有编译                  |
+| Modules.dll 依赖 MFC                | 限制了使用场景（无法在非MFC项目中使用）                      |
+| 网络层和业务层耦合                  | TcpClientModule_Impl 内部直接处理网络逻辑                    |
+
+1. modules、network、utility模块间循环依赖
 
    ```
    modules ←→ network ←→ utility  ←→ modules (三角循环)
@@ -44,21 +79,14 @@
 
    - `module` 下混杂了 UI 代码（Dialog、Session UI）和业务逻辑
 
-### 企业级IM系统架构设计考虑因素
+4. UI代码混入modules：Dialog、Layout等界面代码与业务逻辑混在一起
 
-1. 模块化设计：每个功能应该独立模块，便于单独编译和测试
-2. 低耦合高内聚：减少模块间依赖，避免循环引用
-3. 可扩展性：新功能可以容易地添加而不影响现有功能
-4. 部署灵活性：核心IM功能应该独立，支持按需启动其他服务
 
-对于音视频、云盘、远程控制这些功能，采用插件化架构会更合适。通过抽象接口定义模块边界，利用依赖注入和工厂模式来管理模块生命周期，这样能在不影响主程序稳定性的前提下实现功能扩展。
 
-### 改造方案
+# 改造方案1：分层架构
 
 1. 可以考虑将network和utility提升到独立的基础库级别，让各业务模块都依赖它们，从而解决循环依赖问题。
 2. 另一种方案是建立更清晰的层级结构：基础层处理核心功能、业务层承载具体模块、公共层提供共享代码。在TTClient下采用include/src目录分离头文件和实现，能让项目结构更加规范。
-
-#### 方案1：分层架构
 
 ```shell
 teamtalk-win/
@@ -86,7 +114,7 @@ teamtalk-win/
 └── sharelib/                   # 导出库/配置文件
 ```
 
-#### 方案2：插件化架构/长期演进
+# 改造方案2：插件化架构/长期演进
 
 ```cpp
 // 核心框架定义模块接口
@@ -119,7 +147,7 @@ modules/
     └── plugin.json
 ```
 
-#### 循环依赖解决方案
+### 循环依赖解决方案
 
 ```shell
 # 修改前的依赖关系
@@ -183,7 +211,7 @@ TTClient/
 └── framework/include/            # $(SolutionDir)\framework\include
 ```
 
-#### 改进建议
+### 改进建议
 
 | 改进项                | 优先级 | 说明                   |
 | :-------------------- | :----- | :--------------------- |
@@ -195,40 +223,7 @@ TTClient/
 
 
 
-
-
-
-
-# 现有架构分析
-
----
-
-```shell
-teamtalk.exe
-    └── Modules.dll (包含所有业务模块)
-         ├── network.lib (网络层)
-         ├── utility.lib (工具库)
-         └── DuiLib.lib (UI框架)
-
-sharesrc/ (公共源码)
-    ├── protocal/    ← Protobuf协议定义
-    ├── libsecurity/ ← 加密算法
-    └── yaolog/      ← 日志库
-```
-
-核心设计亮点：
-
-1. MKO观察者模式：模块间通过事件解耦，降低耦合度
-2. 分层清晰：UI -> modules -> network -> utility
-3. 动态库模块化：modules.dll封装了所有的业务模块
-
-存在的问题：
-
-1. modules.dll过于臃肿，所有的模块都编译成一个dll
-2. 循环依赖问题：Base模块被所有模块依赖，Base又依赖Base内部
-3. UI代码混入modules：Dialog、Layout等界面代码与业务逻辑混在一起
-
-# 架构改进兼容后续扩展
+# 改造方案3：架构改进兼容后续扩展
 
 ---
 
@@ -335,8 +330,6 @@ gRPC作为跨平台通信框架也可考虑。
 
 不过实施这一架构需要权衡三个关键问题：C++环境下缺乏像Java那样成熟的RPC框架，IM系统对实时性要求极高IPC可能成为瓶颈，以及团队可能缺乏微服务架构的实践经验。我应该为用户提供一份既务实又可落地的详细改造方案。
 
-这是一个很好的方向！让我为你设计一个基于微服务架构的拆分方案。
-
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        IPC 通信架构                               │
@@ -357,7 +350,27 @@ gRPC作为跨平台通信框架也可考虑。
 └────────┴───────────────────┴───────────────────┴──────────────┘
 ```
 
-#### 消息格式设计
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  进程间通信方式对比                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  方式           速度      复杂度    适用场景                  │
+│  ─────────────────────────────────────────────              │
+│  WM_COPYDATA    快        低        Win32原生，适合UI进程    │
+│  命名管道       中        中        可靠的请求-响应模式       │
+│  Socket(TCP)    中        中        跨机器/稳定性要求高      │
+│  共享内存       最快      高        大数据共享（文件传输）     │
+│  消息队列       快        低        异步事件通知              │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+
+推荐组合：
+- UI进程 ↔ 核心进程：命名管道 + 自定义消息协议
+- 大文件传输：共享内存 + Socket通知
+```
+
+#### 通信消息格式设计
 
 ```cpp
 // IPC 消息头
@@ -401,6 +414,60 @@ enum IPCMsgType : uint16_t {
     IPC_MSG_REMOTE_SCREEN   = 0x4003,  // 屏幕数据
 };
 ```
+
+```cpp
+// framework/common/im_protocol.h
+
+// 进程间消息头
+struct IPCMessageHeader {
+    uint32_t    magic;          // 魔数 0x5454454E ("TTEN")
+    uint16_t    version;       // 协议版本
+    uint16_t    cmd_type;      // 命令类型
+    uint32_t    src_process;   // 源进程ID
+    uint32_t    dst_process;   // 目标进程ID
+    uint32_t    seq_id;        // 序列号（用于请求-响应匹配）
+    uint32_t    body_length;   // 消息体长度
+};
+
+// 进程ID定义
+enum ProcessID {
+    PROCESS_CORE   = 1,
+    PROCESS_UI     = 2,
+    PROCESS_VIDEO  = 3,
+    PROCESS_CLOUD  = 4,
+    PROCESS_REMOTE = 5,
+    PROCESS_SOCIAL = 6,
+};
+
+// 跨进程命令类型
+enum IPCmdType {
+    // UI → Core
+    IPCMD_UI_LOGIN_REQUEST     = 1001,
+    IPCMD_UI_SEND_MESSAGE      = 1002,
+    IPCMD_UI_CREATE_GROUP      = 1003,
+    
+    // Core → UI
+    IPCMD_CORE_MESSAGE_RECEIVED = 2001,
+    IPCMD_CORE_USER_STATUS_CHANGED = 2002,
+    IPCMD_CORE_LOGIN_SUCCESS    = 2003,
+    
+    // 音视频相关
+    IPCMD_VIDEO_CALL_REQUEST   = 3001,
+    IPCMD_VIDEO_CALL_ACCEPTED  = 3002,
+    IPCMD_VIDEO_CALL_END       = 3003,
+    
+    // 云盘相关
+    IPCMD_CLOUD_UPLOAD_PROGRESS = 4001,
+    IPCMD_CLOUD_DOWNLOAD_COMPLETE = 4002,
+    
+    // 远程控制相关
+    IPCMD_REMOTE_CONTROL_START  = 5001,
+    IPCMD_REMOTE_CONTROL_STOP   = 5002,
+    IPCMD_REMOTE_SCREEN_DATA    = 5003,
+};
+```
+
+
 
 #### 服务注册与发现
 
@@ -765,9 +832,22 @@ public:
 | Phase 4 | 音视频模块   | 开发im-audio.exe        |
 | Phase 5 | 云盘模块     | 开发im-cloud.exe        |
 
+
+
+
+
 # 其他问题
 
----
+### 改造方案对比
+
+| 维度     | 方案1（清晰分层）    | 方案2（插件化）     | 微服务架构            |
+| :------- | :------------------- | :------------------ | :-------------------- |
+| 进程数   | 单进程               | 单进程/可选多进程   | 多进程                |
+| 模块隔离 | 编译时隔离           | 运行时加载          | 进程级隔离            |
+| 部署     | 整体部署             | 可选热更新          | 独立部署升级          |
+| 通信方式 | 函数调用+MKO         | 函数调用+MKO        | IPC通信               |
+| 崩溃影响 | 一个模块挂导致全部挂 | 可选隔离            | 单进程崩溃不影响其他  |
+| 适用场景 | 中小型应用           | 中型应用/部分插件化 | 大型应用/需要高可靠性 |
 
 ### MKO模式的保留
 
@@ -828,6 +908,12 @@ public:
    - gRPC
    - 共享内存 + 消息队列
    - Windows Message（仅限同桌面会话）
+
+
+
+
+
+
 
 
 
